@@ -1,6 +1,6 @@
 # Chrome MCP — Windows Survival Guide
 
-Six real gotchas I hit installing and operating [`hangwin/mcp-chrome`](https://github.com/hangwin/mcp-chrome) on Windows 11 — the MCP server that drives your *actual* logged-in Chrome (not a fresh sandbox) so AI tools like [Claude Code](https://claude.ai/code) can act on your real accounts, cookies, sessions and bookmarks.
+Nine real gotchas I hit installing and operating [`hangwin/mcp-chrome`](https://github.com/hangwin/mcp-chrome) on Windows 11 — the MCP server that drives your *actual* logged-in Chrome (not a fresh sandbox) so AI tools like [Claude Code](https://claude.ai/code) can act on your real accounts, cookies, sessions and bookmarks.
 
 The official README covers the happy path. This guide covers the failure modes you'll hit on Windows 11 — each with the symptom you'll see, the root cause I traced, and the fix that actually worked. Two of them (#5 and #6) are upstream issues I opened and PR'd on 2026-05-18 — the rest are pure operator knowledge.
 
@@ -12,12 +12,22 @@ The official README covers the happy path. This guide covers the failure modes y
 
 - [Quick install](#quick-install) — the happy path that *does* work
 - [Diagnose first](#diagnose-which-gotcha-are-you-hitting) — which gotcha are you hitting?
+
+**Install-time gotchas (Chrome + extension + bridge setup):**
+
 - [Gotcha 1 — Chrome 136+ silently drops `--remote-debugging-port`](#gotcha-1--chrome-136-silently-drops---remote-debugging-port-on-the-default-profile)
 - [Gotcha 2 — MCP boot has no auto-retry · install bridge BEFORE Claude CLI starts](#gotcha-2--mcp-boot-has-no-auto-retry--install-the-bridge-before-claude-cli-starts)
 - [Gotcha 3 — bridge ↔ extension version sync](#gotcha-3--bridge-and-extension-versions-must-match)
 - [Gotcha 4 — Claude for Chrome and chrome-mcp fight over `chrome.debugger`](#gotcha-4--claude-for-chrome-and-chrome-mcp-fight-over-chromedebugger-per-tab)
 - [Gotcha 5 — Multi-session orphaning · singleton MCP Server reassigns transport](#gotcha-5--multi-session-orphaning--singleton-mcp-server-reassigns-transport)
 - [Gotcha 6 — Multi-profile port collision · Approach B workaround](#gotcha-6--multi-profile-port-collision--approach-b-workaround)
+
+**Operational gotchas (post-install · runtime · these only surface when actively driving the browser):**
+
+- [Gotcha 7 — `isTrusted=false` blocks OAuth · password · file-dialog clicks](#gotcha-7--istrustedfalse-blocks-oauth--password--file-dialog-clicks)
+- [Gotcha 8 — CDP redaction when a password input is in the DOM](#gotcha-8--cdp-redaction-when-a-password-input-is-in-the-dom)
+- [Gotcha 9 — `chrome_keyboard` text input has surprising parser limits · use `insertText` instead](#gotcha-9--chrome_keyboard-text-input-has-surprising-parser-limits--use-inserttext-instead)
+- [Cost-aware usage · token efficiency hierarchy](#cost-aware-usage--token-efficiency-hierarchy)
 - [Appendix · Upstream contributions](#appendix--upstream-contributions)
 - [Sponsors](#sponsors)
 
@@ -63,6 +73,9 @@ Verify with: `mcp-chrome-bridge doctor` (returns OK once the extension is Connec
 | `chrome-mcp` tools work *until* you open a tab where Anthropic's Claude for Chrome extension is active · then that tab returns "Cannot attach debugger" or silently no-ops | [#4](#gotcha-4--claude-for-chrome-and-chrome-mcp-fight-over-chromedebugger-per-tab) |
 | Open a second Claude Code session · the first one's `chrome-mcp` tools stop responding · every context switch needs Disconnect/Connect on the extension popup | [#5](#gotcha-5--multi-session-orphaning--singleton-mcp-server-reassigns-transport) |
 | Installed extension in multiple Chrome profiles · only one profile's tools work · the others show "Connected" but fail | [#6](#gotcha-6--multi-profile-port-collision--approach-b-workaround) |
+| `chrome_click_element` succeeds with no error but the click "did nothing" on an OAuth popup / login form / file dialog | [#7](#gotcha-7--istrustedfalse-blocks-oauth--password--file-dialog-clicks) |
+| `chrome_javascript` returns `"Cannot access a chrome-extension:// URL of different extension"` for every call · works on other tabs | [#8](#gotcha-8--cdp-redaction-when-a-password-input-is-in-the-dom) |
+| `chrome_keyboard keys="some_text"` returns `"Invalid key string or combination"` for any text with underscores · single chars work | [#9](#gotcha-9--chrome_keyboard-text-input-has-surprising-parser-limits--use-inserttext-instead) |
 
 ---
 
@@ -312,6 +325,136 @@ The cleaner architecture is a single bridge process that multiplexes across prof
 
 ---
 
+## Gotcha 7 — `isTrusted=false` blocks OAuth · password · file-dialog clicks
+
+### Symptom
+
+You ask the AI to click "Generate Access Token" in an OAuth flow, "Sign in with Google", a password-protected admin panel, or a file picker dialog. `chrome_click_element` returns `success: true`. But nothing happens — the popup doesn't open, the form doesn't submit, no console error.
+
+### Root cause
+
+Chrome marks DOM events as `isTrusted=true` (issued by genuine user input — mouse, keyboard, touch) or `isTrusted=false` (issued by JavaScript — `.click()`, `dispatchEvent`, CDP `Input.dispatchMouseEvent`). For most elements the distinction is invisible. But for **security-sensitive UI surfaces**, browsers reject `isTrusted=false`:
+
+- OAuth consent screens and "Generate Token" buttons
+- Password reveal toggles · "Save password" prompts
+- File picker dialogs (`<input type=file>` opening the OS dialog)
+- "Allow notifications" / "Allow camera" permission prompts
+- "Save as PDF" / "Print to PDF" dialog confirmations
+- Some payment confirmation buttons (Stripe Elements, vendor 3DS challenge frames)
+
+This isn't a chrome-mcp bug — it's Chrome's user-activation requirement. The CDP `Input.dispatchMouseEvent` that backs `chrome_click_element` produces synthetic events that fail Chrome's "must be user activation" check on these surfaces. Verified 2026-05-17 against Meta Graph API Explorer's "Generate Access Token" button and Meta Business Suite's "App Live" publish button.
+
+### Fix
+
+There is no programmatic workaround at the chrome-mcp layer — this is enforced by Chrome itself. Options:
+
+| Strategy | When to use |
+|---|---|
+| **Have the user click once, then automate the rest** | Best for OAuth · the user clicks "Generate Token" · everything after that (copy token, paste into env var, restart bridge) the agent can do |
+| **Pre-stage credentials** | If the workflow re-triggers an OAuth flow every run, swap to long-lived tokens / personal access tokens / API key auth so the agent never needs to click the consent button |
+| **Take screenshot, ask user, wait** | The agent can present the screenshot, identify the exact pixel coordinates of the button, and ask the user to click it. Slower but unblocks the agent loop |
+
+If the question is "can I detect ahead of time that a click will fail?" — sometimes. Watch for these patterns and treat them as user-action-required:
+
+```js
+// In chrome_javascript pre-flight before chrome_click_element:
+const el = document.querySelector(selector);
+const insideOAuth = !!el?.closest('form[action*="oauth"], form[action*="auth"]');
+const isFileInput = el?.type === 'file' || el?.closest('label')?.querySelector('input[type=file]');
+const isPasswordContext = !!document.querySelector('input[type=password]:not([disabled])');
+if (insideOAuth || isFileInput || isPasswordContext) {
+  // ask user instead of trying chrome_click_element
+}
+```
+
+This is a heuristic, not a contract. The real signal you'll see is `success: true` + no behavior change.
+
+---
+
+## Gotcha 8 — CDP redaction when a password input is in the DOM
+
+### Symptom
+
+`chrome_javascript` calls suddenly return `"Cannot access a chrome-extension:// URL of different extension"` for every JS call on a specific tab. The error makes no sense — you're not calling chrome-extension URLs. Other tabs work fine. Refreshing fixes it briefly.
+
+### Root cause
+
+Chrome's CDP `Runtime.evaluate` (which backs `chrome_javascript`) refuses to run when an `<input type="password">` element is present in the page DOM **and** that page is in a sensitive context (top-level navigation to a login form, an admin panel, etc.). The error message is misleading — it's not actually about chrome-extension URLs. It's Chrome's blanket "do not allow programmatic JS execution while credentials might be on screen" policy.
+
+This often surfaces on Meta Business Suite admin pages, Google Cloud Console, AWS Console, Stripe Dashboard — any place that gates parts of the UI behind a "confirm your password" re-auth interstitial.
+
+### Workaround
+
+You can't run JS until the password field leaves the DOM. Options in priority order:
+
+1. **`chrome_screenshot` instead of `chrome_javascript`** — image pixels bypass the CDP block. The agent can read the screenshot (visually) and decide the next move. Caveat: secret values rendered on screen sit in your transcript image; treat the transcript as sensitive.
+
+2. **`chrome_read_page` for text** — sometimes works while `chrome_javascript` is blocked because the underlying CDP method is different.
+
+3. **Navigate away first** — `chrome_navigate` to a neutral URL, do the JS, then navigate back. Loses the page state.
+
+4. **Wait out the re-auth interstitial** — Meta / Google's "confirm your password" overlay clears once the user re-authenticates. After that, JS execution resumes.
+
+There's also a related lesser-known mode: input values matching token-shaped patterns (e.g. `EAA...` for Meta access tokens, long alphanumeric sequences) get masked in `chrome_javascript` return values even when password fields aren't in the DOM. `chrome_screenshot` bypasses this too — same caveat about secret-in-transcript.
+
+---
+
+## Gotcha 9 — `chrome_keyboard` text input has surprising parser limits · use `insertText` instead
+
+### Symptom
+
+You want the agent to type `ads_management` into a text field. `chrome_keyboard keys="ads_management"` returns `"Invalid key string or combination"`. Single-character calls work (`keys="a"` followed by `keys="d"` ...). React-controlled inputs ignore the keystrokes even when they do go through.
+
+### Root cause
+
+`chrome_keyboard` parses its `keys` argument as a chord notation (e.g. `Ctrl+Shift+P`), not as raw text. The `_` character is treated as a separator. Many other characters (`+`, `@`, `:`, `/`) similarly confuse the parser. And for React / Vue / framework-controlled inputs, even successful keystrokes can be silently overwritten by the framework's controlled-value re-render.
+
+### Workaround · `document.execCommand('insertText')`
+
+For any arbitrary text input — paste-like behavior that also triggers React's onChange synthesizer correctly:
+
+```js
+// In chrome_javascript:
+const el = document.querySelector('input[name="permission"]');  // or any input/textarea
+el.focus();
+document.execCommand('insertText', false, 'ads_management');
+```
+
+This works because:
+- `insertText` is a real Chrome edit command — produces `input` events that frameworks respect
+- It accepts arbitrary strings including underscores, punctuation, multi-line content
+- React's `onChange` fires correctly — the controlled-value gets the new text
+
+For chord shortcuts (`Ctrl+S`, `Cmd+Shift+P`), keep using `chrome_keyboard` — that's what it's designed for. For typing text, prefer `insertText`.
+
+---
+
+## Cost-aware usage · token efficiency hierarchy
+
+Once chrome-mcp is working, the bigger optimization is **how much each tool call costs your model context**. Empirically (verified across multi-hour AI-driven browser sessions in 2026-05):
+
+| Tool | Approximate context cost | When to prefer |
+|---|---|---|
+| `chrome_javascript` | ~50-200 tokens / call | reading values · checking element state · pre-flight checks |
+| `chrome_read_page` | ~100-500 tokens / call (depends on page size) | extracting text content · article body · table data |
+| `chrome_get_web_content` | ~200-800 tokens / call | structured extraction · returns DOM tree summary |
+| `chrome_click_element` | ~30 tokens / call | interaction · cheap |
+| `chrome_fill_or_select` | ~50 tokens / call | form input · cheap |
+| `chrome_network_capture` | ~200-1500 tokens (depends on request count) | debugging API calls · inspecting XHR/fetch |
+| `chrome_screenshot` | **~1500-3000 tokens / image** | visual verification · pixel-level checks · CDP-redacted page (Gotcha 8) |
+
+The big one is `chrome_screenshot`. A single screenshot is roughly 10-30× the cost of a `chrome_javascript` call. Across a 30-screenshot session, that's ~75K tokens that could have been a few hundred via `chrome_javascript` + `chrome_read_page` instead.
+
+**Rule of thumb:** JS-first. Use `chrome_screenshot` only when:
+
+- You genuinely need to verify a pixel-level visual (a modal rendered correctly · a chart drew · a color change)
+- `chrome_javascript` is blocked (Gotcha 8 — password input in DOM)
+- You need to confirm the green checkmark / red error banner that the JS state doesn't expose
+
+For "check that the form value was set" → `chrome_javascript` returns `document.querySelector('input').value`. For "check that the form was submitted" → `chrome_javascript` checks for the success URL change or a confirmation element. Reserve screenshots for the cases where the visual is the source of truth.
+
+---
+
 ## Appendix · Upstream contributions
 
 If you want the diagnostic walkthrough rather than the answers, the issue + PR thread tells the full story:
@@ -332,7 +475,7 @@ This guide is free and the patches above are upstream-PR'd. If it saved you the 
 - ⭐ Star [`hangwin/mcp-chrome`](https://github.com/hangwin/mcp-chrome) — the actual project doing the heavy lifting
 - 💛 [GitHub Sponsors](https://github.com/sponsors/MankhongGarden) — sustains weekend OSS work like this
 
-If you hit a Windows install pain not in this guide, [open an issue](https://github.com/MankhongGarden/chrome-mcp-windows-survival-guide/issues) — I'd rather add a Gotcha 7 than have you debug alone.
+If you hit a Windows install pain not in this guide, [open an issue](https://github.com/MankhongGarden/chrome-mcp-windows-survival-guide/issues) — I'd rather add a Gotcha 10 than have you debug alone.
 
 ---
 
